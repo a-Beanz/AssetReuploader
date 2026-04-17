@@ -412,7 +412,6 @@ async function runJobImages(jobId, assetIDs, creatorID, isGroup, apiKey) {
                 jobInfo.message = `${uploadedCount}/${totalToUpload} uploaded`;
             }
 
-            // updated moderation handling
             for (const entry of newlyCreated) {
                 let moderationState = null;
 
@@ -593,61 +592,45 @@ Failures: ${jobInfo.failures.length}`);
     }
 }
 
+async function uploadMeshOpenCloud(filePath, creatorID, isGroup, apiKey, oldAssetId) {
+    const creationContext = isGroup
+        ? { creator: { groupId: parseInt(creatorID, 10) } }
+        : { creator: { userId: parseInt(creatorID, 10) } };
 
-async function getMeshCsrfToken(url, cookie) {
-    const res = await fetch(url, {
-        method: "POST",
-        headers: {
-            "Cookie": cookie,
-            "Content-Type": "application/octet-stream",
-            "Requester": "Client"
-        },
-        body: ""
+    const form = new FormData();
+    form.append("request", JSON.stringify({
+        assetType: "Mesh",
+        displayName: path.basename(filePath, ".rbxmesh"),
+        description: `Reuploaded from rbxassetid://${oldAssetId}`,
+        creationContext
+    }));
+    form.append("fileContent", fs.createReadStream(filePath), {
+        filename: path.basename(filePath),
+        contentType: "model/x-file-mesh-data"
     });
-    const token = res.headers.get("x-csrf-token");
-    if (!token) {
-        throw new Error("Failed to retrieve x-csrf-token for mesh upload");
+
+    const response = await fetch("https://apis.roblox.com/assets/v1/assets", {
+        method: "POST",
+        headers: { "x-api-key": apiKey },
+        body: form
+    });
+
+    if (response.status === 201) {
+        const data = await response.json();
+        if (!data.assetId) throw new Error(`Response missing assetId. Full: ${JSON.stringify(data)}`);
+        return data.assetId;
     }
-    return token;
+    if (response.status === 200) {
+        const opData = await response.json();
+        if (!opData.operationId) throw new Error(`Got 200 but no operationId. Full: ${JSON.stringify(opData)}`);
+        return await pollOperationUntilDone(opData.operationId, apiKey);
+    }
+
+    const errorText = await response.text().catch(() => "");
+    throw new Error(`Open Cloud mesh upload failed (status ${response.status}): ${errorText}`);
 }
 
-async function uploadMesh(filePath, cookie, creatorID, isGroup) {
-    const baseUrl = "https://data.roblox.com/ide/publish/UploadNewMesh";
-    const url = new URL(baseUrl);
-    url.searchParams.set("name", "RenderMesh");
-    url.searchParams.set("description", "RenderMesh");
-    url.searchParams.set("isPublic", "False");
-    url.searchParams.set("genreTypeId", "1");
-    url.searchParams.set("allowComments", "False");
-    if (isGroup) {
-        url.searchParams.set("groupId", creatorID);
-    }
-    
-    const meshCsrfToken = await getMeshCsrfToken(url.toString(), cookie);
-
-    const fileStream = fs.createReadStream(filePath);
-    const resp = await fetch(url.toString(), {
-        method: "POST",
-        headers: {
-            "Cookie": cookie,
-            "User-Agent": "RobloxStudio/WinInet",
-            "x-csrf-token": meshCsrfToken
-        },
-        body: fileStream
-    });
-    if (!resp.ok) {
-        const errorText = await resp.text();
-        throw new Error(`Mesh upload failed (status ${resp.status}): ${errorText}`);
-    }
-    const text = (await resp.text()).trim();
-    const assetId = parseInt(text, 10);
-    if (isNaN(assetId)) {
-        throw new Error(`Mesh upload returned invalid assetId: ${text}`);
-    }
-    return assetId;
-}
-
-async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey) {
+async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey, cookie) {
     const jobInfo = jobs[jobId];
     if (!jobInfo) {
         throw new Error(`No job info found for jobId ${jobId}`);
@@ -662,6 +645,15 @@ async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey) {
         jobInfo.total = assetIDs.length;
         jobInfo.done = 0;
         jobInfo.message = "Starting downloads...";
+
+        if (!cookie) {
+            console.log("[runJobMeshes] No cookie in JSON => calling rbx_cookie.exe...");
+            cookie = getCookieFromRustCLI();
+            if (!cookie) {
+                throw new Error("rbx_cookie.exe did not find a .ROBLOSECURITY cookie!");
+            }
+            console.log("[runJobMeshes] Retrieved cookie from Rust CLI.");
+        }
 
         const downloaded = [];
         let downloadedCount = 0;
@@ -704,11 +696,6 @@ async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey) {
         let uploadedCount = 0;
         jobInfo.message = "Starting mesh uploads...";
 
-        let cookie = getCookieFromRustCLI();
-        if (!cookie) {
-            throw new Error("Mesh upload: .ROBLOSECURITY cookie not found.");
-        }
-
         for (let i = 0; i < downloaded.length; i += 60) {
             const slice = downloaded.slice(i, i + 60);
 
@@ -717,7 +704,7 @@ async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey) {
                 uploadedCount++;
                 try {
                     jobInfo.message = `${uploadedCount}/${totalToUpload} uploading mesh...`;
-                    const newAssetId = await uploadMesh(item.filePath, cookie, creatorID, isGroup);
+                    const newAssetId = await uploadMeshOpenCloud(item.filePath, creatorID, isGroup, apiKey, item.oldId);
                     newlyCreated.push({
                         oldId: item.oldId,
                         newId: newAssetId
@@ -751,8 +738,7 @@ async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey) {
             }
         }
 
-        let finalMsg = `${jobInfo.results.length} mesh(es) reuploaded.`;
-        jobInfo.message = finalMsg;
+        jobInfo.message = `${jobInfo.results.length} mesh(es) reuploaded.`;
         jobInfo.finished = true;
 
         console.log(`[runJobMeshes] Job ${jobId} complete.
@@ -792,11 +778,11 @@ function handleUpload(req, res, body) {
             error: "Missing required fields (assetIDs, creatorID, uploadType)"
         }));
     }
-    if ((uploadType === "Images" || uploadType === "Meshes") && !apiKey) {
-        console.error("[handleUpload] Missing apiKey for images/meshes.");
+    if (uploadType === "Images" && !apiKey) {
+        console.error("[handleUpload] Missing apiKey for images.");
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({
-            error: "Missing 'apiKey' (required for Images or Meshes)."
+            error: "Missing 'apiKey' (required for Images)."
         }));
     }
 
@@ -830,7 +816,7 @@ function handleUpload(req, res, body) {
                 jobs[jobId].finished = true;
             });
     } else if (uploadType === "Meshes") {
-        runJobMeshes(jobId, assetIDs, creatorID, !!isGroup, apiKey)
+        runJobMeshes(jobId, assetIDs, creatorID, !!isGroup, apiKey || "", cookie || "")
             .catch((err) => {
                 console.error(`[handleUpload] Fatal mesh job error:`, err);
                 jobs[jobId].message = `Fatal: ${err.message}`;
@@ -840,6 +826,9 @@ function handleUpload(req, res, body) {
         console.warn(`[handleUpload] Unsupported uploadType: ${uploadType}`);
         jobs[jobId].message = `Error: Unsupported uploadType ${uploadType}`;
         jobs[jobId].finished = true;
+    }
+    if ((uploadType === "Images" || uploadType === "Meshes") && !apiKey) {
+        console.warn(`[handleUpload] No API key provided for ${uploadType} upload. This will likely cause failures.`);
     }
 }
 

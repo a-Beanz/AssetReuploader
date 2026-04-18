@@ -1,3 +1,5 @@
+# NOTE: Hi! this is a slight continuation of this project meant for use as an internal tool for one of my projects.
+----
 # AssetReuploader
 ## Latest release has mesh and animation support!
 
